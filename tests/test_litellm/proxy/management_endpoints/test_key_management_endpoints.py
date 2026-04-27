@@ -9290,15 +9290,22 @@ def _make_team_key(token: str, team_id: str = "team-abc") -> LiteLLM_Verificatio
     )
 
 
-def _patch_team_keys_helpers(monkeypatch, *, hash_lookup):
-    """Common monkeypatching for the bulk_update_team_keys path."""
+def _patch_team_keys_helpers(monkeypatch):
+    """
+    Common monkeypatching for the bulk_update_team_keys path.
+
+    Treats `_hash_token_if_needed` as identity — these tests pass tokens that
+    are already in their DB-stored form (no `sk-` prefix), so hashing is a
+    no-op. The dedicated regression test for raw `sk-` hashing exercises the
+    real helper.
+    """
     monkeypatch.setattr(
         "litellm.proxy.management_endpoints.key_management_endpoints.prepare_key_update_data",
         AsyncMock(return_value={"max_budget": 50.0}),
     )
     monkeypatch.setattr(
         "litellm.proxy.management_endpoints.key_management_endpoints._hash_token_if_needed",
-        lambda token: hash_lookup[token],
+        lambda token: token,
     )
     monkeypatch.setattr(
         "litellm.proxy.management_endpoints.key_management_endpoints._delete_cache_key_object",
@@ -9344,9 +9351,7 @@ async def test_bulk_update_team_keys_success_with_key_ids(monkeypatch):
     monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.user_custom_key_update", None)
-    _patch_team_keys_helpers(
-        monkeypatch, hash_lookup={"tok-a": "hashed-a", "tok-b": "hashed-b"}
-    )
+    _patch_team_keys_helpers(monkeypatch)
     monkeypatch.setattr(
         "litellm.proxy.management_endpoints.key_management_endpoints.TeamMemberPermissionChecks.can_team_member_execute_key_management_endpoint",
         AsyncMock(),
@@ -9414,9 +9419,7 @@ async def test_bulk_update_team_keys_success_all_keys_in_team(monkeypatch):
     monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.user_custom_key_update", None)
-    _patch_team_keys_helpers(
-        monkeypatch, hash_lookup={f"tok-{i}": f"hashed-{i}" for i in range(3)}
-    )
+    _patch_team_keys_helpers(monkeypatch)
     monkeypatch.setattr(
         "litellm.proxy.management_endpoints.key_management_endpoints.TeamMemberPermissionChecks.can_team_member_execute_key_management_endpoint",
         AsyncMock(),
@@ -9476,7 +9479,7 @@ async def test_bulk_update_team_keys_key_not_in_team(monkeypatch):
     monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.user_custom_key_update", None)
-    _patch_team_keys_helpers(monkeypatch, hash_lookup={"tok-a": "hashed-a"})
+    _patch_team_keys_helpers(monkeypatch)
     monkeypatch.setattr(
         "litellm.proxy.management_endpoints.key_management_endpoints.TeamMemberPermissionChecks.can_team_member_execute_key_management_endpoint",
         AsyncMock(),
@@ -9531,7 +9534,7 @@ async def test_bulk_update_team_keys_team_admin_authorized(monkeypatch):
     monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.user_custom_key_update", None)
-    _patch_team_keys_helpers(monkeypatch, hash_lookup={"tok-a": "hashed-a"})
+    _patch_team_keys_helpers(monkeypatch)
 
     auth_check = AsyncMock()
     monkeypatch.setattr(
@@ -9736,3 +9739,94 @@ async def test_bulk_update_team_keys_no_keys_found(monkeypatch):
         )
 
     assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_team_keys_hashes_raw_sk_key_ids(monkeypatch):
+    """
+    Regression: when key_ids contains raw `sk-...` tokens, they must be hashed
+    before the DB lookup (the DB stores SHA-256 hashes). Without this, the
+    find_many `token IN (...)` filter would silently return no rows and every
+    requested key would land in failed_updates as 'not found in team'.
+    """
+    from litellm.proxy._types import hash_token
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        bulk_update_team_keys,
+    )
+    from litellm.types.proxy.management_endpoints.key_management_endpoints import (
+        BulkUpdateTeamKeysRequest,
+        KeyUpdateFields,
+    )
+
+    raw_sk = "sk-rawkey1234567890"
+    hashed = hash_token(raw_sk)
+    in_team_row = LiteLLM_VerificationToken(
+        token=hashed,
+        user_id="user-123",
+        models=[],
+        team_id="team-abc",
+        max_budget=None,
+    )
+
+    mock_prisma_client = AsyncMock()
+    mock_prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(
+        return_value=[in_team_row]
+    )
+    mock_prisma_client.db.litellm_verificationtoken.find_unique = AsyncMock(
+        return_value=in_team_row
+    )
+    updated = MagicMock()
+    updated.model_dump.return_value = {"max_budget": 50.0}
+    mock_prisma_client.update_data = AsyncMock(return_value={"data": updated})
+
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_custom_key_update", None)
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.prepare_key_update_data",
+        AsyncMock(return_value={"max_budget": 50.0}),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints._delete_cache_key_object",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.KeyManagementEventHooks.async_key_updated_hook",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.TeamMemberPermissionChecks.can_team_member_execute_key_management_endpoint",
+        AsyncMock(),
+    )
+
+    request = BulkUpdateTeamKeysRequest(
+        team_id="team-abc",
+        key_ids=[raw_sk],
+        update_fields=KeyUpdateFields(max_budget=50.0),
+    )
+    response = await bulk_update_team_keys(
+        data=request,
+        user_api_key_dict=UserAPIKeyAuth(
+            user_role=LitellmUserRoles.PROXY_ADMIN,
+            api_key="sk-admin",
+            user_id="admin",
+        ),
+        litellm_changed_by=None,
+    )
+
+    # find_many must be called with the *hashed* token id, not the raw sk-
+    where_arg = (
+        mock_prisma_client.db.litellm_verificationtoken.find_many.await_args.kwargs[
+            "where"
+        ]
+    )
+    assert where_arg["token"] == {
+        "in": [hashed]
+    }, f"expected hashed token in DB lookup, got {where_arg['token']}"
+
+    # And the response should report the user-supplied raw sk- form, not the hash
+    assert len(response.successful_updates) == 1
+    assert len(response.failed_updates) == 0
+    assert response.successful_updates[0].key == raw_sk
